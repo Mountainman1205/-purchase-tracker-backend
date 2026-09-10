@@ -291,7 +291,12 @@ def stats_summary(user: models.User = Depends(get_current_user), db: Session = D
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
-    TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+
+def get_or_create_user_by_telegram_id(
 
 
 def get_or_create_user_by_telegram_id(
