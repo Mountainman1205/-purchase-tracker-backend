@@ -1,7 +1,6 @@
 import httpx
 import re
 import os
-import os
 from dotenv import load_dotenv
 load_dotenv()
 from collections import defaultdict
@@ -57,6 +56,7 @@ def get_current_user(
             raise HTTPException(401, "Invalid Telegram init data")
 
     telegram_id = str(tg_user["id"])
+    print(f"[MINI APP] telegram_id = {telegram_id}")
     user = db.query(models.User).filter(models.User.telegram_id == telegram_id).first()
 
     if user is None:
@@ -296,9 +296,6 @@ def health():
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
-
-
-
 def get_or_create_user_by_telegram_id(
     telegram_id: str, username: str | None, first_name: str | None, db: Session
 ) -> models.User:
@@ -347,6 +344,7 @@ async def telegram_webhook(update: dict, db: Session = Depends(get_db)):
     chat_id = message["chat"]["id"]
     from_user = message.get("from", {})
     telegram_id = str(from_user.get("id"))
+    print(f"[WEBHOOK] telegram_id = {telegram_id}")
     text = message.get("text", "")
 
     user = get_or_create_user_by_telegram_id(
