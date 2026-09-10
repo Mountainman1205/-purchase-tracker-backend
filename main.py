@@ -1,27 +1,32 @@
 import httpx
 import re
 import os
+import base64
+import json
 from dotenv import load_dotenv
 load_dotenv()
 from collections import defaultdict
 from datetime import datetime, timedelta
-
-from fastapi import FastAPI, Depends, HTTPException, Header
+ 
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-
+import anthropic
+ 
 import models
 import schemas
 from database import Base, engine, get_db
 from auth import validate_init_data, DEV_USER
-
+ 
 Base.metadata.create_all(bind=engine)
-
+ 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DEV_MODE = os.getenv("DEV_MODE", "0") == "1"
-
+ 
+anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+ 
 app = FastAPI(title="Purchase Tracker API")
-
+ 
 # На проде замените "*" на реальный домен вашего фронтенда
 app.add_middleware(
     CORSMiddleware,
@@ -30,7 +35,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+ 
 DEFAULT_CATEGORIES = [
     {"name": "Продукты", "icon": "🛒", "color": "#22C55E"},
     {"name": "Транспорт", "icon": "🚕", "color": "#3B82F6"},
@@ -40,8 +45,8 @@ DEFAULT_CATEGORIES = [
     {"name": "Здоровье", "icon": "💊", "color": "#EF4444"},
     {"name": "Прочее", "icon": "💳", "color": "#6B7280"},
 ]
-
-
+ 
+ 
 def get_current_user(
     x_telegram_init_data: str | None = Header(default=None),
     db: Session = Depends(get_db),
@@ -54,11 +59,11 @@ def get_current_user(
         tg_user = validate_init_data(x_telegram_init_data, BOT_TOKEN)
         if tg_user is None:
             raise HTTPException(401, "Invalid Telegram init data")
-
+ 
     telegram_id = str(tg_user["id"])
     print(f"[MINI APP] telegram_id = {telegram_id}")
     user = db.query(models.User).filter(models.User.telegram_id == telegram_id).first()
-
+ 
     if user is None:
         user = models.User(
             telegram_id=telegram_id,
@@ -68,23 +73,23 @@ def get_current_user(
         db.add(user)
         db.commit()
         db.refresh(user)
-
+ 
         # Создаём дефолтные категории для нового пользователя
         for cat in DEFAULT_CATEGORIES:
             db.add(models.Category(user_id=user.id, **cat))
         db.commit()
-
+ 
     return user
-
-
+ 
+ 
 # --------------------------------------------------------------------------
 # Categories
 # --------------------------------------------------------------------------
 @app.get("/api/categories", response_model=list[schemas.CategoryOut])
 def list_categories(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     return db.query(models.Category).filter(models.Category.user_id == user.id).all()
-
-
+ 
+ 
 @app.post("/api/categories", response_model=schemas.CategoryOut)
 def create_category(
     payload: schemas.CategoryCreate,
@@ -96,8 +101,8 @@ def create_category(
     db.commit()
     db.refresh(cat)
     return cat
-
-
+ 
+ 
 @app.delete("/api/categories/{category_id}")
 def delete_category(
     category_id: int,
@@ -112,8 +117,8 @@ def delete_category(
     db.delete(cat)
     db.commit()
     return {"ok": True}
-
-
+ 
+ 
 # --------------------------------------------------------------------------
 # Purchases
 # --------------------------------------------------------------------------
@@ -128,8 +133,8 @@ def list_purchases(
     if category_id is not None:
         q = q.filter(models.Purchase.category_id == category_id)
     return q.order_by(models.Purchase.date.desc()).limit(limit).all()
-
-
+ 
+ 
 @app.post("/api/purchases", response_model=schemas.PurchaseOut)
 def create_purchase(
     payload: schemas.PurchaseCreate,
@@ -147,8 +152,8 @@ def create_purchase(
     db.commit()
     db.refresh(purchase)
     return purchase
-
-
+ 
+ 
 @app.delete("/api/purchases/{purchase_id}")
 def delete_purchase(
     purchase_id: int,
@@ -163,8 +168,64 @@ def delete_purchase(
     db.delete(purchase)
     db.commit()
     return {"ok": True}
-
-
+ 
+ 
+# --------------------------------------------------------------------------
+# Receipt recognition (shared helper for bot + Mini App)
+# --------------------------------------------------------------------------
+def analyze_receipt(image_bytes: bytes, media_type: str = "image/jpeg") -> dict:
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    try:
+        resp = anthropic_client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                    {"type": "text", "text": (
+                        "Извлеки из чека данные и верни ТОЛЬКО валидный JSON без markdown-обёртки, "
+                        "в формате: "
+                        '{"store": "название магазина или null", "total": число, '
+                        '"items": [{"name": "название", "price": число}]}. '
+                        "Если total не виден явно — просчитай сумму по items. "
+                        'Если это вообще не похоже на чек — верни {"store": null, "total": 0, "items": []}.'
+                    )},
+                ],
+            }],
+        )
+        text = resp.content[0].text.strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"[RECEIPT] analyze_receipt error: {e}")
+        return {"store": None, "total": 0, "items": []}
+ 
+ 
+@app.post("/api/purchases/from-receipt", response_model=schemas.PurchaseOut)
+async def create_purchase_from_receipt(
+    file: UploadFile = File(...),
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    image_bytes = await file.read()
+    data = analyze_receipt(image_bytes, media_type=file.content_type or "image/jpeg")
+    if not data.get("total"):
+        raise HTTPException(400, "Не удалось распознать чек")
+ 
+    items_text = "\n".join(f"{i['name']}: {i['price']}" for i in data.get("items", []))
+    description = (data.get("store") or "Чек") + (f"\n{items_text}" if items_text else "")
+ 
+    purchase = models.Purchase(
+        user_id=user.id, amount=data["total"], category_id=None,
+        description=description, date=datetime.utcnow(),
+    )
+    db.add(purchase)
+    db.commit()
+    db.refresh(purchase)
+    return purchase
+ 
+ 
 # --------------------------------------------------------------------------
 # Budgets
 # --------------------------------------------------------------------------
@@ -174,13 +235,13 @@ def _period_start(period: str) -> datetime:
         return now - timedelta(days=now.weekday())
     # по умолчанию — месяц
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-
+ 
+ 
 @app.get("/api/budgets", response_model=list[schemas.BudgetOut])
 def list_budgets(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     return db.query(models.Budget).filter(models.Budget.user_id == user.id).all()
-
-
+ 
+ 
 @app.post("/api/budgets", response_model=schemas.BudgetOut)
 def create_budget(
     payload: schemas.BudgetCreate,
@@ -192,8 +253,8 @@ def create_budget(
     db.commit()
     db.refresh(budget)
     return budget
-
-
+ 
+ 
 @app.delete("/api/budgets/{budget_id}")
 def delete_budget(
     budget_id: int,
@@ -208,8 +269,8 @@ def delete_budget(
     db.delete(budget)
     db.commit()
     return {"ok": True}
-
-
+ 
+ 
 @app.get("/api/budgets/status", response_model=list[schemas.BudgetStatus])
 def budgets_status(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     budgets = db.query(models.Budget).filter(models.Budget.user_id == user.id).all()
@@ -231,31 +292,31 @@ def budgets_status(user: models.User = Depends(get_current_user), db: Session = 
             )
         )
     return result
-
-
+ 
+ 
 # --------------------------------------------------------------------------
 # Stats
 # --------------------------------------------------------------------------
 @app.get("/api/stats/summary", response_model=schemas.StatsSummary)
 def stats_summary(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     purchases = db.query(models.Purchase).filter(models.Purchase.user_id == user.id).all()
-
+ 
     by_category_map = defaultdict(float)
     cat_info = {}
     by_month_map = defaultdict(float)
-
+ 
     now = datetime.utcnow()
     current_month_key = now.strftime("%Y-%m")
     total_all_time = 0.0
     total_current_month = 0.0
-
+ 
     for p in purchases:
         total_all_time += p.amount
         month_key = p.date.strftime("%Y-%m")
         by_month_map[month_key] += p.amount
         if month_key == current_month_key:
             total_current_month += p.amount
-
+ 
         if p.category:
             key = p.category.id
             cat_info[key] = (p.category.name, p.category.icon, p.category.color)
@@ -263,7 +324,7 @@ def stats_summary(user: models.User = Depends(get_current_user), db: Session = D
             key = None
             cat_info[key] = ("Без категории", "❔", "#9CA3AF")
         by_category_map[key] += p.amount
-
+ 
     by_category = [
         schemas.SummaryByCategory(
             category_id=k,
@@ -274,28 +335,28 @@ def stats_summary(user: models.User = Depends(get_current_user), db: Session = D
         )
         for k, v in sorted(by_category_map.items(), key=lambda x: -x[1])
     ]
-
+ 
     by_month = [
         schemas.SummaryByMonth(month=k, total=round(v, 2))
         for k, v in sorted(by_month_map.items())
     ]
-
+ 
     return schemas.StatsSummary(
         by_category=by_category,
         by_month=by_month,
         total_all_time=round(total_all_time, 2),
         total_current_month=round(total_current_month, 2),
     )
-
-
+ 
+ 
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
-
-
+ 
+ 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-
+ 
+ 
 def get_or_create_user_by_telegram_id(
     telegram_id: str, username: str | None, first_name: str | None, db: Session
 ) -> models.User:
@@ -309,8 +370,8 @@ def get_or_create_user_by_telegram_id(
             db.add(models.Category(user_id=user.id, **cat))
         db.commit()
     return user
-
-
+ 
+ 
 def parse_quick_purchase(text: str, categories: list[models.Category]):
     """Извлекает сумму и категорию из текста вида 'такси 320'."""
     match = re.search(r"(\d+(?:[.,]\d+)?)", text)
@@ -318,53 +379,92 @@ def parse_quick_purchase(text: str, categories: list[models.Category]):
         return None
     amount = float(match.group(1).replace(",", "."))
     rest = (text[: match.start()] + text[match.end() :]).strip()
-
+ 
     matched_category = None
     for cat in categories:
         if cat.name.lower() in rest.lower():
             matched_category = cat
             rest = re.sub(re.escape(cat.name), "", rest, flags=re.IGNORECASE).strip()
             break
-
+ 
     description = rest.strip() or None
     return amount, matched_category, description
-
-
+ 
+ 
 async def send_telegram_message(chat_id: int, text: str):
     async with httpx.AsyncClient() as client:
         await client.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
-
-
+ 
+ 
 @app.post("/telegram/webhook")
 async def telegram_webhook(update: dict, db: Session = Depends(get_db)):
     message = update.get("message")
     if not message:
         return {"ok": True}
-
+ 
     chat_id = message["chat"]["id"]
     from_user = message.get("from", {})
     telegram_id = str(from_user.get("id"))
     print(f"[WEBHOOK] telegram_id = {telegram_id}")
     text = message.get("text", "")
-
+ 
     user = get_or_create_user_by_telegram_id(
         telegram_id, from_user.get("username"), from_user.get("first_name"), db
     )
-
+ 
     if text.startswith("/start"):
         await send_telegram_message(
             chat_id,
-            "Привет! Просто напиши сумму и категорию, например: «такси 320» или «продукты 1500», и я добавлю покупку.",
+            "Привет! Просто напиши сумму и категорию, например: «такси 320» или «продукты 1500», "
+            "и я добавлю покупку. Или пришли фото чека — я распознаю его сам.",
         )
         return {"ok": True}
-
+ 
+    # --- Обработка фото чека ---
+    photos = message.get("photo")
+    if photos:
+        file_id = photos[-1]["file_id"]  # берём самое крупное фото (последнее в списке)
+        async with httpx.AsyncClient() as client:
+            file_info_resp = await client.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id})
+            file_info = file_info_resp.json()
+            file_path = file_info["result"]["file_path"]
+            file_resp = await client.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}")
+            file_bytes = file_resp.content
+ 
+        data = analyze_receipt(file_bytes)
+        if not data.get("total"):
+            await send_telegram_message(chat_id, "Не удалось распознать чек 😕 Попробуй фото почётче.")
+            return {"ok": True}
+ 
+        items_text = "\n".join(f"- {i['name']}: {i['price']}" for i in data.get("items", []))
+        description = data.get("store") or "Чек"
+        if items_text:
+            description += "\n" + items_text
+ 
+        purchase = models.Purchase(
+            user_id=user.id,
+            amount=data["total"],
+            category_id=None,
+            description=description,
+            date=datetime.utcnow(),
+        )
+        db.add(purchase)
+        db.commit()
+ 
+        await send_telegram_message(
+            chat_id,
+            f"Добавлено по чеку: {data['total']:.0f} ₽ — {data.get('store') or 'без названия'}"
+            + (f"\n{items_text}" if items_text else ""),
+        )
+        return {"ok": True}
+ 
     categories = db.query(models.Category).filter(models.Category.user_id == user.id).all()
     parsed = parse_quick_purchase(text, categories)
-
+ 
     if parsed is None:
-        await send_telegram_message(chat_id, "Не нашёл сумму в сообщении. Напиши, например: «кафе 450»")
+        await send_telegram_message(chat_id, "Не нашёл сумму в сообщении. Напиши, например: «кафе 450», или пришли фото чека.")
         return {"ok": True}
-
+ 
     amount, category, description = parsed
     purchase = models.Purchase(
         user_id=user.id,
@@ -375,7 +475,7 @@ async def telegram_webhook(update: dict, db: Session = Depends(get_db)):
     )
     db.add(purchase)
     db.commit()
-
+ 
     cat_label = category.name if category else "Без категории"
     extra = f" ({description})" if description else ""
     await send_telegram_message(chat_id, f"Добавлено: {amount:.0f} ₽ — {cat_label}{extra}")
