@@ -296,7 +296,7 @@ def health():
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
-def get_or_create_user_by_telegram_id(
+
 
 
 def get_or_create_user_by_telegram_id(
