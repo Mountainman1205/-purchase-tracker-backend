@@ -420,41 +420,13 @@ async def telegram_webhook(update: dict, db: Session = Depends(get_db)):
         )
         return {"ok": True}
  
-    # --- Обработка фото чека ---
+    # --- Обработка фото чека (временно отключено) ---
     photos = message.get("photo")
     if photos:
-        file_id = photos[-1]["file_id"]  # берём самое крупное фото (последнее в списке)
-        async with httpx.AsyncClient() as client:
-            file_info_resp = await client.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id})
-            file_info = file_info_resp.json()
-            file_path = file_info["result"]["file_path"]
-            file_resp = await client.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}")
-            file_bytes = file_resp.content
- 
-        data = analyze_receipt(file_bytes)
-        if not data.get("total"):
-            await send_telegram_message(chat_id, "Не удалось распознать чек 😕 Попробуй фото почётче.")
-            return {"ok": True}
- 
-        items_text = "\n".join(f"- {i['name']}: {i['price']}" for i in data.get("items", []))
-        description = data.get("store") or "Чек"
-        if items_text:
-            description += "\n" + items_text
- 
-        purchase = models.Purchase(
-            user_id=user.id,
-            amount=data["total"],
-            category_id=None,
-            description=description,
-            date=datetime.utcnow(),
-        )
-        db.add(purchase)
-        db.commit()
- 
         await send_telegram_message(
             chat_id,
-            f"Добавлено по чеку: {data['total']:.0f} ₽ — {data.get('store') or 'без названия'}"
-            + (f"\n{items_text}" if items_text else ""),
+            "Распознавание чеков временно не работает, приносим свои извинения 🙏 "
+            "Пока просто напиши сумму и категорию текстом, например: «такси 320».",
         )
         return {"ok": True}
  
