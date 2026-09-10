@@ -291,3 +291,89 @@ def stats_summary(user: models.User = Depends(get_current_user), db: Session = D
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+    TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+
+def get_or_create_user_by_telegram_id(
+    telegram_id: str, username: str | None, first_name: str | None, db: Session
+) -> models.User:
+    user = db.query(models.User).filter(models.User.telegram_id == telegram_id).first()
+    if user is None:
+        user = models.User(telegram_id=telegram_id, username=username, first_name=first_name)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        for cat in DEFAULT_CATEGORIES:
+            db.add(models.Category(user_id=user.id, **cat))
+        db.commit()
+    return user
+
+
+def parse_quick_purchase(text: str, categories: list[models.Category]):
+    """Извлекает сумму и категорию из текста вида 'такси 320'."""
+    match = re.search(r"(\d+(?:[.,]\d+)?)", text)
+    if not match:
+        return None
+    amount = float(match.group(1).replace(",", "."))
+    rest = (text[: match.start()] + text[match.end() :]).strip()
+
+    matched_category = None
+    for cat in categories:
+        if cat.name.lower() in rest.lower():
+            matched_category = cat
+            rest = re.sub(re.escape(cat.name), "", rest, flags=re.IGNORECASE).strip()
+            break
+
+    description = rest.strip() or None
+    return amount, matched_category, description
+
+
+async def send_telegram_message(chat_id: int, text: str):
+    async with httpx.AsyncClient() as client:
+        await client.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(update: dict, db: Session = Depends(get_db)):
+    message = update.get("message")
+    if not message:
+        return {"ok": True}
+
+    chat_id = message["chat"]["id"]
+    from_user = message.get("from", {})
+    telegram_id = str(from_user.get("id"))
+    text = message.get("text", "")
+
+    user = get_or_create_user_by_telegram_id(
+        telegram_id, from_user.get("username"), from_user.get("first_name"), db
+    )
+
+    if text.startswith("/start"):
+        await send_telegram_message(
+            chat_id,
+            "Привет! Просто напиши сумму и категорию, например: «такси 320» или «продукты 1500», и я добавлю покупку.",
+        )
+        return {"ok": True}
+
+    categories = db.query(models.Category).filter(models.Category.user_id == user.id).all()
+    parsed = parse_quick_purchase(text, categories)
+
+    if parsed is None:
+        await send_telegram_message(chat_id, "Не нашёл сумму в сообщении. Напиши, например: «кафе 450»")
+        return {"ok": True}
+
+    amount, category, description = parsed
+    purchase = models.Purchase(
+        user_id=user.id,
+        amount=amount,
+        category_id=category.id if category else None,
+        description=description,
+        date=datetime.utcnow(),
+    )
+    db.add(purchase)
+    db.commit()
+
+    cat_label = category.name if category else "Без категории"
+    extra = f" ({description})" if description else ""
+    await send_telegram_message(chat_id, f"Добавлено: {amount:.0f} ₽ — {cat_label}{extra}")
+    return {"ok": True}
