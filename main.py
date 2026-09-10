@@ -208,6 +208,7 @@ async def create_purchase_from_receipt(
     user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    raise HTTPException(503, "Распознавание чеков временно не работает, приносим свои извинения 🙏")
     image_bytes = await file.read()
     data = analyze_receipt(image_bytes, media_type=file.content_type or "image/jpeg")
     if not data.get("total"):
